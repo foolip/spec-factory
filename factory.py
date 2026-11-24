@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 
-import argparse, os, subprocess, uuid, json, requests
+import argparse, base64, os, subprocess, uuid, json, requests
 
 OBSOLETE_FILES = [".travis.yml", "deploy_key.enc", "CONTRIBUTING.md", "PULL_REQUEST_TEMPLATE.md"]
 TEMPLATES = {}
@@ -153,6 +153,8 @@ def create_pr(shortname):
 # https://github.com/whatwg/misc-server/issues/107.
 ENVIRONMENT = "production"
 R2_SECRETS = ["R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY", "R2_ENDPOINT"]
+# Where the R2 secret values are kept: a private repository only admins can read.
+R2_SECRETS_FILE = ("whatwg/admin", "cloudflare-r2.json")
 BOT = "whatbot"
 
 
@@ -163,7 +165,21 @@ def gh_api(*args, input=None):
     return result.stdout
 
 
-def update_settings(shortname):
+def load_r2_secrets():
+    """The R2 secret values: from environment variables if all are set, else
+    from cloudflare-r2.json in whatwg/admin."""
+    if all(os.environ.get(name) for name in R2_SECRETS):
+        return {name: os.environ[name] for name in R2_SECRETS}
+    repo, path = R2_SECRETS_FILE
+    content = gh_api("repos/{}/contents/{}".format(repo, path), "--jq", ".content")
+    values = json.loads(base64.b64decode(content))
+    missing = [name for name in R2_SECRETS if not values.get(name)]
+    if missing:
+        raise RuntimeError("{}/{} is missing: {}".format(repo, path, ", ".join(missing)))
+    return {name: values[name] for name in R2_SECRETS}
+
+
+def update_settings(shortname, r2_secrets):
     """Checks and fixes the GitHub settings of whatwg/<shortname>. Returns a
     list of problems that need a person."""
     repo = "whatwg/{}".format(shortname)
@@ -197,28 +213,28 @@ def update_settings(shortname):
     if others:
         problems.append("{} environment also allows: {}".format(ENVIRONMENT, ", ".join(others)))
 
-    # Secrets are set only when given in the environment of this script, as
-    # their values aren't stored anywhere else.
+    # Always (re)set the secrets, so that a run after updating
+    # cloudflare-r2.json rotates them everywhere. Values go through stdin, so
+    # they don't show up in the process list.
     for name in R2_SECRETS:
-        value = os.environ.get(name)
-        if value:
-            subprocess.run(["gh", "secret", "set", name, "--repo", repo, "--env", ENVIRONMENT],
-                           input=value, text=True, capture_output=True, check=True)
-            print("  set {}".format(name))
-    existing = gh_api(env + "/secrets", "--jq", ".secrets[].name").split()
-    missing = [name for name in R2_SECRETS if name not in existing]
-    if missing:
-        problems.append("{} environment is missing secrets: {}".format(ENVIRONMENT, ", ".join(missing)))
+        subprocess.run(["gh", "secret", "set", name, "--repo", repo, "--env", ENVIRONMENT],
+                       input=r2_secrets[name], text=True, capture_output=True, check=True)
+    print("  set {}".format(", ".join(R2_SECRETS)))
 
     return problems
 
 
 def update_all_settings(shortnames):
+    try:
+        r2_secrets = load_r2_secrets()
+    except (RuntimeError, ValueError) as e:
+        print("Can't get the R2 secrets: {}".format(e))
+        return True
     failed = False
     for shortname in shortnames:
         print("whatwg/{}".format(shortname))
         try:
-            problems = update_settings(shortname)
+            problems = update_settings(shortname, r2_secrets)
         except (RuntimeError, subprocess.CalledProcessError) as e:
             problems = [str(e)]
         for problem in problems:
