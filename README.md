@@ -9,6 +9,6 @@ This repository enables repositories of WHATWG standards to be organized central
 - gives `whatbot` write access, which it needs to report the Participation check;
 - checks that `main` has a ruleset requiring pull requests, and stops there if not;
 - creates or updates the `production` environment so that only the `main` branch can use it;
-- sets the environment's R2 deploy secrets (`R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_ENDPOINT`) to the values in `cloudflare-r2.json` in the private whatwg/admin repository, or to environment variables of the same names if all three are set.
+- sets the environment's R2 deploy secrets (`R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_ENDPOINT`), asking for their values (or taking them from environment variables of the same names, if all three are set).
 
-To rotate the credentials, create a new R2 token, update `cloudflare-r2.json`, run `factory.py --settings --all`, and delete the old token. It exits with status 1 if anything needs a person. See [whatwg/misc-server#107](https://github.com/whatwg/misc-server/issues/107).
+The values aren't stored anywhere, so each run uses a new R2 token, and replaces the credentials of every standard. That is also how a new standard gets them: create a new R2 token (Object Read & Write on `whatwg-sites`), run `factory.py --settings --all` with it, do the same for whatwg/whatwg.org (see whatwg/misc-server's `setup-deploy-environment.sh`), and then delete the old token. It exits with status 1 if anything needs a person. See [whatwg/misc-server#107](https://github.com/whatwg/misc-server/issues/107).

@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 
-import argparse, base64, os, subprocess, uuid, json, requests
+import argparse, getpass, os, subprocess, uuid, json, requests
 
 OBSOLETE_FILES = [".travis.yml", "deploy_key.enc", "CONTRIBUTING.md", "PULL_REQUEST_TEMPLATE.md"]
 TEMPLATES = {}
@@ -153,8 +153,6 @@ def create_pr(shortname):
 # https://github.com/whatwg/misc-server/issues/107.
 ENVIRONMENT = "production"
 R2_SECRETS = ["R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY", "R2_ENDPOINT"]
-# Where the R2 secret values are kept: a private repository only admins can read.
-R2_SECRETS_FILE = ("whatwg/admin", "cloudflare-r2.json")
 BOT = "whatbot"
 
 
@@ -166,17 +164,18 @@ def gh_api(*args, input=None):
 
 
 def load_r2_secrets():
-    """The R2 secret values: from environment variables if all are set, else
-    from cloudflare-r2.json in whatwg/admin."""
+    """The R2 secret values, which aren't stored anywhere: from environment
+    variables if all are set, else asked for (the secret key without echo)."""
     if all(os.environ.get(name) for name in R2_SECRETS):
         return {name: os.environ[name] for name in R2_SECRETS}
-    repo, path = R2_SECRETS_FILE
-    content = gh_api("repos/{}/contents/{}".format(repo, path), "--jq", ".content")
-    values = json.loads(base64.b64decode(content))
-    missing = [name for name in R2_SECRETS if not values.get(name)]
-    if missing:
-        raise RuntimeError("{}/{} is missing: {}".format(repo, path, ", ".join(missing)))
-    return {name: values[name] for name in R2_SECRETS}
+    print("Values of the new R2 API token (Cloudflare shows them when the token is created):")
+    values = {}
+    for name in R2_SECRETS:
+        ask = getpass.getpass if name == "R2_SECRET_ACCESS_KEY" else input
+        values[name] = ask("  {}: ".format(name)).strip()
+        if not values[name]:
+            raise RuntimeError("no value for {}".format(name))
+    return values
 
 
 def update_settings(shortname, r2_secrets):
@@ -213,9 +212,9 @@ def update_settings(shortname, r2_secrets):
     if others:
         problems.append("{} environment also allows: {}".format(ENVIRONMENT, ", ".join(others)))
 
-    # Always (re)set the secrets, so that a run after updating
-    # cloudflare-r2.json rotates them everywhere. Values go through stdin, so
-    # they don't show up in the process list.
+    # Always (re)set the secrets, so that a run with a new token rotates them
+    # everywhere. Values go through stdin, so they don't show up in the
+    # process list.
     for name in R2_SECRETS:
         subprocess.run(["gh", "secret", "set", name, "--repo", repo, "--env", ENVIRONMENT],
                        input=r2_secrets[name], text=True, capture_output=True, check=True)
@@ -227,7 +226,7 @@ def update_settings(shortname, r2_secrets):
 def update_all_settings(shortnames):
     try:
         r2_secrets = load_r2_secrets()
-    except (RuntimeError, ValueError) as e:
+    except (RuntimeError, EOFError) as e:
         print("Can't get the R2 secrets: {}".format(e))
         return True
     failed = False
