@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 
-import argparse, getpass, os, subprocess, uuid, json, requests
+import argparse, os, subprocess, uuid, json, requests
 
 OBSOLETE_FILES = [".travis.yml", "deploy_key.enc", "CONTRIBUTING.md", "PULL_REQUEST_TEMPLATE.md"]
 TEMPLATES = {}
@@ -149,104 +149,6 @@ def create_pr(shortname):
     os.chdir(".")
 
 
-# Repository settings on GitHub, checked and fixed by --settings. See
-# https://github.com/whatwg/misc-server/issues/107.
-ENVIRONMENT = "production"
-R2_SECRETS = ["R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY", "R2_ENDPOINT"]
-BOT = "whatbot"
-
-
-def gh_api(*args, input=None):
-    result = subprocess.run(["gh", "api", *args], input=input, capture_output=True, text=True)
-    if result.returncode != 0:
-        raise RuntimeError("gh api {}: {}".format(" ".join(args), result.stderr.strip()))
-    return result.stdout
-
-
-def load_r2_secrets():
-    """The R2 secret values, which aren't stored anywhere: from environment
-    variables if all are set, else asked for (the secret key without echo)."""
-    if all(os.environ.get(name) for name in R2_SECRETS):
-        return {name: os.environ[name] for name in R2_SECRETS}
-    print("Values of the new R2 API token (Cloudflare shows them when the token is created):")
-    values = {}
-    for name in R2_SECRETS:
-        ask = getpass.getpass if name == "R2_SECRET_ACCESS_KEY" else input
-        values[name] = ask("  {}: ".format(name)).strip()
-        if not values[name]:
-            raise RuntimeError("no value for {}".format(name))
-    return values
-
-
-def update_settings(shortname, r2_secrets):
-    """Checks and fixes the GitHub settings of whatwg/<shortname>. Returns a
-    list of problems that need a person."""
-    repo = "whatwg/{}".format(shortname)
-    problems = []
-
-    # whatbot writes commit statuses (the Participation check), which needs
-    # write access.
-    permission = gh_api("repos/{}/collaborators/{}/permission".format(repo, BOT), "--jq", ".permission").strip()
-    if permission not in ("admin", "write"):
-        gh_api("-X", "PUT", "repos/{}/collaborators/{}".format(repo, BOT), "-f", "permission=push")
-        print("  gave {} write access (was {})".format(BOT, permission))
-
-    # The production environment holds the deploy credentials. Only main may
-    # use it, and that only means "reviewed" if main is protected by a ruleset
-    # requiring pull requests.
-    rules = gh_api("repos/{}/rules/branches/main".format(repo), "--jq", ".[].type").split()
-    if "pull_request" not in rules:
-        problems.append("main has no ruleset requiring pull requests; not setting up the {} environment".format(ENVIRONMENT))
-        return problems
-
-    env = "repos/{}/environments/{}".format(repo, ENVIRONMENT)
-    # Selected branches, not "protected branches only": that only counts
-    # classic branch protection, and allows every branch if there is none.
-    gh_api("-X", "PUT", env, "--input", "-", input=json.dumps(
-        {"deployment_branch_policy": {"protected_branches": False, "custom_branch_policies": True}}))
-    policies = json.loads(gh_api(env + "/deployment-branch-policies"))["branch_policies"]
-    if not any(p["name"] == "main" and p.get("type", "branch") == "branch" for p in policies):
-        gh_api("-X", "POST", env + "/deployment-branch-policies", "-f", "name=main", "-f", "type=branch")
-        print("  allowed main to use the {} environment".format(ENVIRONMENT))
-    others = [p["name"] for p in policies if not (p["name"] == "main" and p.get("type", "branch") == "branch")]
-    if others:
-        problems.append("{} environment also allows: {}".format(ENVIRONMENT, ", ".join(others)))
-
-    # Always (re)set the secrets, so that a run with a new token rotates them
-    # everywhere. Values go through stdin, so they don't show up in the
-    # process list.
-    for name in R2_SECRETS:
-        subprocess.run(["gh", "secret", "set", name, "--repo", repo, "--env", ENVIRONMENT],
-                       input=r2_secrets[name], text=True, capture_output=True, check=True)
-    print("  set {}".format(", ".join(R2_SECRETS)))
-
-    return problems
-
-
-def update_all_settings(shortnames):
-    try:
-        r2_secrets = load_r2_secrets()
-    except (RuntimeError, EOFError) as e:
-        print("Can't get the R2 secrets: {}".format(e))
-        return True
-    failed = False
-    for shortname in shortnames:
-        print("whatwg/{}".format(shortname))
-        try:
-            problems = update_settings(shortname, r2_secrets)
-        except (RuntimeError, subprocess.CalledProcessError) as e:
-            problems = [str(e)]
-        for problem in problems:
-            print("  PROBLEM: {}".format(problem))
-        failed = failed or bool(problems)
-    return failed
-
-
-def all_shortnames():
-    return [href_to_shortname(standard["href"])
-            for workstream in DB["workstreams"] for standard in workstream["standards"]]
-
-
 def update_all_standards(create_prs = False):
     for workstream in DB["workstreams"]:
         for standard in workstream["standards"]:
@@ -269,18 +171,7 @@ def main():
     parser.add_argument("--single", nargs=2, type=str, metavar=("<shortname>", "<h1>"), help="generate a single standard, e.g., --single xhr XMLHttpRequest")
     parser.add_argument("--all", action="store_true", help="generate all standards (as per SG's db.json)")
     parser.add_argument("--create-prs", action="store_true", help="create PRs; can only be used in combination with --all")
-    parser.add_argument("--settings", action="store_true", help="instead of files, check and fix the GitHub settings of the standards (whatbot access, production environment and its R2 secrets); use with --all or --single")
     args = parser.parse_args()
-
-    if args.settings:
-        if args.all:
-            shortnames = all_shortnames()
-        elif args.single:
-            shortnames = [args.single[0]]
-        else:
-            parser.print_help()
-            exit(1)
-        exit(1 if update_all_settings(shortnames) else 0)
 
     if args.single and not args.create_prs:
         update_files(args.single[0], args.single[1])
