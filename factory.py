@@ -149,6 +149,58 @@ def create_pr(shortname):
     os.chdir(".")
 
 
+# Repository settings on GitHub, checked by --check-settings and fixed by
+# --update-settings. Each check takes the repository ("whatwg/<shortname>") and
+# whether to fix it, and returns a list of problems that remain.
+
+BOT = "whatbot"
+
+
+def gh_api(*args):
+    result = subprocess.run(["gh", "api", *args], capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError("gh api {}: {}".format(" ".join(args), result.stderr.strip()))
+    return result.stdout
+
+
+def check_bot_access(repo, update):
+    """whatbot reports the Participation check (a commit status), which needs
+    write access."""
+    permission = gh_api("repos/{}/collaborators/{}/permission".format(repo, BOT), "--jq", ".permission").strip()
+    if permission in ("admin", "write"):
+        return []
+    if update:
+        gh_api("-X", "PUT", "repos/{}/collaborators/{}".format(repo, BOT), "-f", "permission=push")
+        print("  fixed: gave {} write access (was {})".format(BOT, permission))
+        return []
+    return ["{} has {} access, needs write".format(BOT, permission)]
+
+
+SETTINGS_CHECKS = [check_bot_access]
+
+
+def settings(shortnames, update):
+    """Returns whether every repository's settings are (now) correct."""
+    ok = True
+    for shortname in shortnames:
+        repo = "whatwg/{}".format(shortname)
+        print(repo)
+        for check in SETTINGS_CHECKS:
+            try:
+                problems = check(repo, update)
+            except RuntimeError as e:
+                problems = [str(e)]
+            for problem in problems:
+                print("  problem: {}".format(problem))
+            ok = ok and not problems
+    return ok
+
+
+def all_shortnames():
+    return [href_to_shortname(standard["href"])
+            for workstream in DB["workstreams"] for standard in workstream["standards"]]
+
+
 def update_all_standards(create_prs = False):
     for workstream in DB["workstreams"]:
         for standard in workstream["standards"]:
@@ -171,7 +223,19 @@ def main():
     parser.add_argument("--single", nargs=2, type=str, metavar=("<shortname>", "<h1>"), help="generate a single standard, e.g., --single xhr XMLHttpRequest")
     parser.add_argument("--all", action="store_true", help="generate all standards (as per SG's db.json)")
     parser.add_argument("--create-prs", action="store_true", help="create PRs; can only be used in combination with --all")
+    parser.add_argument("--check-settings", action="store_true", help="instead of files, check the GitHub repository settings (needs gh); use with --all or --single")
+    parser.add_argument("--update-settings", action="store_true", help="instead of files, fix the GitHub repository settings (needs gh, with admin access); use with --all or --single")
     args = parser.parse_args()
+
+    if args.check_settings or args.update_settings:
+        if args.all:
+            shortnames = all_shortnames()
+        elif args.single:
+            shortnames = [args.single[0]]
+        else:
+            parser.print_help()
+            exit(1)
+        exit(0 if settings(shortnames, args.update_settings) else 1)
 
     if args.single and not args.create_prs:
         update_files(args.single[0], args.single[1])
