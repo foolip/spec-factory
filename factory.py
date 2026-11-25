@@ -150,20 +150,125 @@ def create_pr(shortname):
 
 
 # Repository settings on GitHub, checked by --check-settings and fixed by
-# --update-settings. Each check takes the repository ("whatwg/<shortname>") and
-# whether to fix it, and returns a list of problems that remain.
+# --update-settings. Organization-level settings are checked once, then each
+# repository's. Each check takes whether to fix it (and the repository) and
+# returns a list of problems that remain.
 
+ORG = "whatwg"
 BOT = "whatbot"
 
+# Branch protection is an organization ruleset that applies to the default
+# branch of every repository whose custom property "standard" is true.
+PROPERTY = "standard"
+REQUIRED_CHECKS = ["Build", "Participation"]
+RULES = [
+    {"type": "deletion"},
+    {"type": "non_fast_forward"},
+    {"type": "required_linear_history"},
+    {"type": "pull_request", "parameters": {
+        "required_approving_review_count": 1,
+        "dismiss_stale_reviews_on_push": False,
+        "require_code_owner_review": False,
+        "require_last_push_approval": False,
+        "required_review_thread_resolution": False,
+    }},
+    {"type": "required_status_checks", "parameters": {
+        "strict_required_status_checks_policy": False,
+        "required_status_checks": [{"context": check} for check in REQUIRED_CHECKS],
+    }},
+]
+RULESET = {
+    "name": "standards",
+    "target": "branch",
+    "enforcement": "active",
+    "bypass_actors": [],
+    "conditions": {
+        "ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []},
+        "repository_property": {
+            "include": [{"name": PROPERTY, "property_values": ["true"], "source": "custom"}],
+            "exclude": [],
+        },
+    },
+    "rules": RULES,
+}
+PROPERTY_SCHEMA = {
+    "value_type": "true_false",
+    "required": False,
+    "description": "A WHATWG standard: its default branch is protected by the standards ruleset (see whatwg/spec-factory)",
+}
 
-def gh_api(*args):
-    result = subprocess.run(["gh", "api", *args], capture_output=True, text=True)
+
+def gh_api(*args, input=None, allow_404=False):
+    """Runs `gh api`; with allow_404, returns None for a 404."""
+    command = ["gh", "api", *args]
+    if input is not None:
+        command += ["--input", "-"]
+        input = json.dumps(input)
+    result = subprocess.run(command, input=input, capture_output=True, text=True)
     if result.returncode != 0:
+        if allow_404 and "HTTP 404" in result.stderr:
+            return None
         raise RuntimeError("gh api {}: {}".format(" ".join(args), result.stderr.strip()))
     return result.stdout
 
 
-def check_bot_access(repo, update):
+def gh_json(*args, **kwargs):
+    output = gh_api(*args, **kwargs)
+    return None if output is None else json.loads(output)
+
+
+def contains(expected, actual):
+    """Whether everything in `expected` is also in `actual`. GitHub adds
+    fields with default values, so an exact comparison would fail."""
+    if isinstance(expected, dict):
+        return isinstance(actual, dict) and all(k in actual and contains(v, actual[k]) for k, v in expected.items())
+    if isinstance(expected, list):
+        return isinstance(actual, list) and len(expected) == len(actual) and all(
+            any(contains(e, a) for a in actual) for e in expected)
+    return expected == actual
+
+
+def check_property_schema(update):
+    if gh_json("orgs/{}/properties/schema/{}".format(ORG, PROPERTY), allow_404=True) is not None:
+        return []
+    if not update:
+        return ["no custom property {!r}".format(PROPERTY)]
+    gh_api("-X", "PUT", "orgs/{}/properties/schema/{}".format(ORG, PROPERTY), input=PROPERTY_SCHEMA)
+    print("  fixed: created the custom property {!r}".format(PROPERTY))
+    return []
+
+
+def check_org_ruleset(update):
+    try:
+        rulesets = gh_json("orgs/{}/rulesets".format(ORG))
+    except RuntimeError as e:
+        # Reading organization rulesets needs an organization owner. Without
+        # that, the per-repository check of the rules in effect still runs.
+        if update or "HTTP 403" not in str(e) and "HTTP 404" not in str(e):
+            raise
+        print("  not checked: organization ruleset (needs an organization owner)")
+        return []
+    ids = [r["id"] for r in rulesets if r["name"] == RULESET["name"]]
+    if not ids:
+        if not update:
+            return ["no organization ruleset {!r}".format(RULESET["name"])]
+        gh_api("-X", "POST", "orgs/{}/rulesets".format(ORG), input=RULESET)
+        print("  fixed: created the organization ruleset {!r}".format(RULESET["name"]))
+        return []
+    current = gh_json("orgs/{}/rulesets/{}".format(ORG, ids[0]))
+    if contains(RULESET, current):
+        return []
+    if not update:
+        return ["organization ruleset {!r} differs from factory.py".format(RULESET["name"])]
+    gh_api("-X", "PUT", "orgs/{}/rulesets/{}".format(ORG, ids[0]), input=RULESET)
+    print("  fixed: updated the organization ruleset {!r}".format(RULESET["name"]))
+    return []
+
+
+ORG_CHECKS = [check_property_schema, check_org_ruleset]
+
+
+def check_bot_access(update, repo):
     """whatbot reports the Participation check (a commit status), which needs
     write access."""
     permission = gh_api("repos/{}/collaborators/{}/permission".format(repo, BOT), "--jq", ".permission").strip()
@@ -176,23 +281,79 @@ def check_bot_access(repo, update):
     return ["{} has {} access, needs write".format(BOT, permission)]
 
 
-SETTINGS_CHECKS = [check_bot_access]
+def reported_checks(repo, ref):
+    runs = gh_api("repos/{}/commits/{}/check-runs".format(repo, ref), "--paginate", "--jq", ".check_runs[].name")
+    statuses = gh_api("repos/{}/commits/{}/status".format(repo, ref), "--jq", ".statuses[].context")
+    return set(runs.split("\n") + statuses.split("\n")) - {""}
+
+
+def check_branch_protection(update, repo):
+    """The default branch is protected by the organization ruleset (through
+    the custom property), and no longer by classic branch protection."""
+    problems = []
+    branch = gh_api("repos/{}".format(repo), "--jq", ".default_branch").strip()
+
+    values = gh_json("repos/{}/properties/values".format(repo))
+    if not any(v["property_name"] == PROPERTY and v["value"] == "true" for v in values):
+        # Setting the property makes the ruleset require the checks, so only
+        # do that once the branch reports them; otherwise no PR could merge.
+        missing = [c for c in REQUIRED_CHECKS if c not in reported_checks(repo, branch)]
+        if missing:
+            return ["{} doesn't report {}, so not setting {!r}".format(branch, ", ".join(missing), PROPERTY)]
+        if not update:
+            return ["custom property {!r} isn't true".format(PROPERTY)]
+        gh_api("-X", "PATCH", "orgs/{}/properties/values".format(ORG), input={
+            "repository_names": [repo.split("/")[1]],
+            "properties": [{"property_name": PROPERTY, "value": "true"}],
+        })
+        print("  fixed: set {!r} to true".format(PROPERTY))
+
+    # The rules in effect on the branch, from any ruleset. Anyone with read
+    # access can see these.
+    effective = gh_json("repos/{}/rules/branches/{}".format(repo, branch))
+    for rule in RULES:
+        if not any(contains(rule, r) for r in effective):
+            problems.append("rule {} isn't in effect on {}".format(rule["type"], branch))
+    if problems:
+        return problems
+
+    # Classic branch protection is redundant once the ruleset is in effect.
+    # Reading it needs admin access; without it, this part isn't checked.
+    try:
+        classic = gh_json("repos/{}/branches/{}/protection".format(repo, branch), allow_404=True)
+    except RuntimeError:
+        classic = None
+    if classic is not None:
+        if not update:
+            return ["{} still has classic branch protection (redundant)".format(branch)]
+        gh_api("-X", "DELETE", "repos/{}/branches/{}/protection".format(repo, branch))
+        print("  fixed: deleted classic branch protection")
+    return problems
+
+
+REPO_CHECKS = [check_bot_access, check_branch_protection]
+
+
+def run_checks(label, checks, update, *args):
+    print(label)
+    ok = True
+    for check in checks:
+        try:
+            problems = check(update, *args)
+        except RuntimeError as e:
+            problems = [str(e)]
+        for problem in problems:
+            print("  problem: {}".format(problem))
+        ok = ok and not problems
+    return ok
 
 
 def settings(shortnames, update):
-    """Returns whether every repository's settings are (now) correct."""
-    ok = True
+    """Returns whether all settings are (now) correct."""
+    ok = run_checks(ORG, ORG_CHECKS, update)
     for shortname in shortnames:
-        repo = "whatwg/{}".format(shortname)
-        print(repo)
-        for check in SETTINGS_CHECKS:
-            try:
-                problems = check(repo, update)
-            except RuntimeError as e:
-                problems = [str(e)]
-            for problem in problems:
-                print("  problem: {}".format(problem))
-            ok = ok and not problems
+        repo = "{}/{}".format(ORG, shortname)
+        ok = run_checks(repo, REPO_CHECKS, update, repo) and ok
     return ok
 
 
