@@ -6,13 +6,16 @@ on the default branch. Repositories with identical
 protection of their default branch are grouped at the end.
 
 Usage:
-  ./branch-protection-report.py [--org whatwg] [--include-archived] [--json]
+  ./branch-protection-report.py [--org whatwg] [--include-archived] [--include-advisory-forks] [--json]
 
-Needs `gh`, logged in. Reading classic branch protection needs admin access to
-the repository; without it that part shows as "unknown".
+Needs `gh`, logged in. Reading the organization's rulesets needs the admin:org
+scope (gh auth refresh -h github.com -s admin:org), and reading classic branch
+protection needs admin access to the repository; without them those parts show
+as "unknown". Temporary private forks for security advisories (named
+<repo>-ghsa-...) are skipped by default.
 """
 
-import argparse, json, subprocess, sys
+import argparse, json, re, subprocess, sys
 from collections import defaultdict
 
 
@@ -206,6 +209,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--org", default="whatwg")
     parser.add_argument("--include-archived", action="store_true")
+    parser.add_argument("--include-advisory-forks", action="store_true",
+                        help="include temporary private forks for security advisories (<repo>-ghsa-...)")
     parser.add_argument("--json", action="store_true", help="print JSON instead of text")
     args = parser.parse_args()
 
@@ -213,6 +218,8 @@ def main():
                    key=lambda r: r["name"].lower())
     if not args.include_archived:
         repos = [r for r in repos if not r["archived"]]
+    if not args.include_advisory_forks:
+        repos = [r for r in repos if not re.search(r"-ghsa(-[a-z0-9]{4}){3}$", r["name"])]
 
     org_rulesets = []
     try:
@@ -221,6 +228,8 @@ def main():
         org_error = None
     except (NotFound, Forbidden) as e:
         org_error = str(e)
+        if "admin:org" in org_error:
+            org_error = "needs the admin:org scope: gh auth refresh -h github.com -s admin:org"
 
     entries = []
     for repo in repos:

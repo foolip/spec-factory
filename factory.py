@@ -206,6 +206,10 @@ def gh_api(*args, input=None, allow_404=False):
         input = json.dumps(input)
     result = subprocess.run(command, input=input, capture_output=True, text=True)
     if result.returncode != 0:
+        # GitHub answers 404 when the token lacks a scope, so that isn't
+        # "doesn't exist".
+        if "admin:org" in result.stderr:
+            raise RuntimeError("gh needs the admin:org scope: gh auth refresh -h github.com -s admin:org")
         if allow_404 and "HTTP 404" in result.stderr:
             return None
         raise RuntimeError("gh api {}: {}".format(" ".join(args), result.stderr.strip()))
@@ -244,9 +248,9 @@ def check_org_ruleset(update):
     except RuntimeError as e:
         # Reading organization rulesets needs an organization owner. Without
         # that, the per-repository check of the rules in effect still runs.
-        if update or "HTTP 403" not in str(e) and "HTTP 404" not in str(e):
+        if update or not any(x in str(e) for x in ("HTTP 403", "HTTP 404", "admin:org")):
             raise
-        print("  not checked: organization ruleset (needs an organization owner)")
+        print("  not checked: organization ruleset (needs an organization owner, and gh with the admin:org scope)")
         return []
     ids = [r["id"] for r in rulesets if r["name"] == RULESET["name"]]
     if not ids:
