@@ -54,7 +54,7 @@ def copy_and_fill_templates(variables):
 
 def fill_template(contents, variables):
     for variable, data in variables.items():
-        if variable in ("not_these_templates", "readme"):
+        if variable in ("not_these_templates", "readme", "settings"):
             continue
         elif variable == "extra_files" and data != "":
             data = "\n\tEXTRA_FILES=\"{}\" \\".format(data)
@@ -291,6 +291,92 @@ def reported_checks(repo, ref):
     return set(runs.split("\n") + statuses.split("\n")) - {""}
 
 
+# Per-repository additions to the organization ruleset, from "settings" in
+# factory.json, each applied as a repository ruleset (rulesets combine, so
+# these can only add restrictions):
+#   "extra_required_checks": ["Test"]   checks required on top of REQUIRED_CHECKS
+#   "require_up_to_date": true          branches must be up to date before merging
+#   "push_teams": ["editors-all-specs"] only these teams can push or merge to
+#                                       the default branch (rulesets can't
+#                                       exempt individual users)
+EXTRA_RULESET_PREFIX = "standard: "
+
+
+def repo_settings(repo):
+    return FACTORY_DB.get(repo.split("/")[1], {}).get("settings", {})
+
+
+def team_id(slug):
+    return gh_json("orgs/{}/teams/{}".format(ORG, slug))["id"]
+
+
+def desired_repo_rulesets(repo):
+    """The repository rulesets that factory.json asks for, by name."""
+    settings = repo_settings(repo)
+    unknown = set(settings) - {"extra_required_checks", "require_up_to_date", "push_teams"}
+    if unknown:
+        raise RuntimeError("unknown settings in factory.json: {}".format(", ".join(sorted(unknown))))
+    branch = {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}}
+    rulesets = {}
+    up_to_date = settings.get("require_up_to_date", False)
+    checks = list(settings.get("extra_required_checks", []))
+    if up_to_date:
+        # "Up to date" is a property of a set of required checks, so this
+        # ruleset requires all of them, strictly.
+        checks = REQUIRED_CHECKS + [c for c in checks if c not in REQUIRED_CHECKS]
+    if checks:
+        name = EXTRA_RULESET_PREFIX + "required checks"
+        rulesets[name] = {
+            "name": name, "target": "branch", "enforcement": "active", "bypass_actors": [],
+            "conditions": branch,
+            "rules": [{"type": "required_status_checks", "parameters": {
+                "strict_required_status_checks_policy": up_to_date,
+                "required_status_checks": [{"context": c} for c in checks],
+            }}],
+        }
+    if settings.get("push_teams"):
+        name = EXTRA_RULESET_PREFIX + "push restriction"
+        rulesets[name] = {
+            "name": name, "target": "branch", "enforcement": "active",
+            # Only the bypass actors may update the branch, which includes
+            # merging pull requests.
+            "bypass_actors": [{"actor_type": "Team", "actor_id": team_id(t), "bypass_mode": "always"}
+                              for t in settings["push_teams"]],
+            "conditions": branch,
+            "rules": [{"type": "update"}],
+        }
+    return rulesets
+
+
+def check_repo_rulesets(update, repo):
+    """The repository rulesets from factory.json exist and match; other
+    rulesets that factory.py manages (by name) are removed."""
+    problems = []
+    desired = desired_repo_rulesets(repo)
+    existing = {r["name"]: r["id"] for r in gh_json("repos/{}/rulesets".format(repo))
+                if r.get("source_type") == "Repository" and r["name"].startswith(EXTRA_RULESET_PREFIX)}
+    for name, ruleset in desired.items():
+        if name not in existing:
+            if not update:
+                problems.append("no repository ruleset {!r}".format(name))
+                continue
+            gh_api("-X", "POST", "repos/{}/rulesets".format(repo), input=ruleset)
+            print("  fixed: created the repository ruleset {!r}".format(name))
+        elif not contains(ruleset, gh_json("repos/{}/rulesets/{}".format(repo, existing[name]))):
+            if not update:
+                problems.append("repository ruleset {!r} differs from factory.json".format(name))
+                continue
+            gh_api("-X", "PUT", "repos/{}/rulesets/{}".format(repo, existing[name]), input=ruleset)
+            print("  fixed: updated the repository ruleset {!r}".format(name))
+    for name in set(existing) - set(desired):
+        if not update:
+            problems.append("repository ruleset {!r} isn't in factory.json".format(name))
+            continue
+        gh_api("-X", "DELETE", "repos/{}/rulesets/{}".format(repo, existing[name]))
+        print("  fixed: deleted the repository ruleset {!r}".format(name))
+    return problems
+
+
 def check_branch_protection(update, repo):
     """The default branch is protected by the organization ruleset (through
     the custom property), and no longer by classic branch protection."""
@@ -315,7 +401,8 @@ def check_branch_protection(update, repo):
     # The rules in effect on the branch, from any ruleset. Anyone with read
     # access can see these.
     effective = gh_json("repos/{}/rules/branches/{}".format(repo, branch))
-    for rule in RULES:
+    expected = RULES + [rule for r in desired_repo_rulesets(repo).values() for rule in r["rules"]]
+    for rule in expected:
         if not any(contains(rule, r) for r in effective):
             problems.append("rule {} isn't in effect on {}".format(rule["type"], branch))
     if problems:
@@ -335,7 +422,9 @@ def check_branch_protection(update, repo):
     return problems
 
 
-REPO_CHECKS = [check_bot_access, check_branch_protection]
+# check_repo_rulesets comes before check_branch_protection, so that the
+# additions are in effect before classic branch protection is deleted.
+REPO_CHECKS = [check_bot_access, check_repo_rulesets, check_branch_protection]
 
 
 def run_checks(label, checks, update, *args):

@@ -5,7 +5,8 @@
   "console": {
     "extra_files": "images/*.*",
     "not_these_templates": [".editorconfig"],
-    "extra_implementers": ["Deno", "Node.js"]
+    "extra_implementers": ["Deno", "Node.js"],
+    "settings": {"require_up_to_date": true}
   },
   "dom": {
     "extra_implementers": [
@@ -23,10 +24,12 @@
   },
   "fetch": {
     "extra_implementers": ["Deno (not for CORS changes)"],
-    "readme": "README.md.anne.template-part"
+    "readme": "README.md.anne.template-part",
+    "settings": {"push_teams": ["editors-all-specs"]}
   },
   "hid": {
-    "extra_files": "blocklist.txt"
+    "extra_files": "blocklist.txt",
+    "settings": {"require_up_to_date": true}
   },
   "html": {
     "not_these_templates": [".editorconfig", ".gitattributes", ".github/CONTRIBUTING.md", ".github/workflows/build.yml", ".gitignore", ".pr-preview.json", "Makefile", "README.md"],
@@ -44,7 +47,8 @@
     "readme": "README.md.anne.template-part"
   },
   "serial": {
-    "extra_files": "bluetooth-service-blocklist.txt"
+    "extra_files": "bluetooth-service-blocklist.txt",
+    "settings": {"require_up_to_date": true}
   },
   "storage": {
     ".gitignore": ["/node_modules/", "/package-lock.json"],
@@ -54,7 +58,8 @@
   "streams": {
     "extra_files": "demos/* demos/**/*",
     "not_these_templates": [".editorconfig", ".github/CONTRIBUTING.md", "README.md"],
-    "extra_implementers": ["Deno", "Node.js"]
+    "extra_implementers": ["Deno", "Node.js"],
+    "settings": {"extra_required_checks": ["Test"]}
   },
   "url": {
     "extra_implementers": ["Deno", "Node.js"],
@@ -69,7 +74,8 @@
     "bikeshed_max_line_length": "off"
   },
   "usb": {
-    "extra_files": "blocklist.txt"
+    "extra_files": "blocklist.txt",
+    "settings": {"require_up_to_date": true}
   },
   "webidl": {
     ".gitignore": ["/node_modules/", "/package-lock.json"],
