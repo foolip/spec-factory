@@ -16,3 +16,5 @@ This repository enables repositories of WHATWG standards to be organized central
   - The default branch has no classic branch protection left, which the ruleset replaces. Reading this needs admin access; otherwise it's skipped.
 
 A new standard is covered by running `--update-settings` for it.
+
+To see how all the organization's repositories are protected today (classic branch protection, rulesets and the rules in effect), grouped by identical protection of the default branch, run `./branch-protection-report.py` (`--json` for the raw data, `--include-archived` to include archived repositories). Reading classic protection needs admin access.
