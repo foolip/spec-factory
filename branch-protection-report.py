@@ -1,7 +1,8 @@
 #!/usr/bin/env python
-"""Lists the repositories of a GitHub organization and how their branches are
-protected: classic branch protection on each protected branch, rulesets, and
-the rules in effect on the default branch. Repositories with identical
+"""Lists the rulesets of a GitHub organization, and its repositories and how
+their branches are protected: classic branch protection on each protected
+branch, the repository's own rulesets (active or not), and the rules in effect
+on the default branch. Repositories with identical
 protection of their default branch are grouped at the end.
 
 Usage:
@@ -68,14 +69,58 @@ def summarize_classic(p):
 
 
 def summarize_rule(rule):
-    """A rule in effect, as a short string."""
+    """A rule, as a short string."""
     params = rule.get("parameters") or {}
     t = rule["type"]
     if t == "pull_request":
-        t += "(approvals={})".format(params.get("required_approving_review_count"))
+        extras = [k for k in ("dismiss_stale_reviews_on_push", "require_code_owner_review",
+                              "require_last_push_approval", "required_review_thread_resolution") if params.get(k)]
+        t += "(approvals={}{})".format(params.get("required_approving_review_count"),
+                                       "".join(", " + k for k in extras))
     elif t == "required_status_checks":
-        t += "({})".format(",".join(sorted(c["context"] for c in params.get("required_status_checks", []))))
+        t += "({}{})".format(",".join(sorted(c["context"] for c in params.get("required_status_checks", []))),
+                             ", strict" if params.get("strict_required_status_checks_policy") else "")
+    elif params:
+        t += "({})".format(json.dumps(params, sort_keys=True))
     return t
+
+
+# Built-in repository roles, as bypass actor IDs.
+REPOSITORY_ROLES = {2: "maintain", 4: "write", 5: "admin"}
+
+
+def describe_actor(a):
+    actor = "{} {}".format(a.get("actor_type"), a.get("actor_id"))
+    if a.get("actor_type") == "RepositoryRole" and a.get("actor_id") in REPOSITORY_ROLES:
+        actor = "repository role " + REPOSITORY_ROLES[a["actor_id"]]
+    elif a.get("actor_type") == "OrganizationAdmin":
+        actor = "organization admins"
+    return "{} ({})".format(actor, a.get("bypass_mode"))
+
+
+def summarize_ruleset(r):
+    """A ruleset's full definition, as a flat dict."""
+    conditions = r.get("conditions") or {}
+    summary = {
+        "name": r["name"],
+        "source": "{} {}".format(r.get("source_type", "?"), r.get("source", "")).strip(),
+        "enforcement": r.get("enforcement"),
+        "target": r.get("target"),
+    }
+    for key, condition in conditions.items():
+        summary[key] = condition
+    summary["bypass"] = sorted(describe_actor(a) for a in r.get("bypass_actors") or [])
+    summary["rules"] = sorted(summarize_rule(rule) for rule in r.get("rules") or [])
+    return summary
+
+
+def print_ruleset(r, indent):
+    print("{}ruleset {!r} ({}, {}, target {})".format(indent, r["name"], r["source"], r["enforcement"], r["target"]))
+    for key, value in r.items():
+        if key in ("name", "source", "enforcement", "target"):
+            continue
+        if value:
+            print("{}  {}: {}".format(indent, key, value if not isinstance(value, list) else ", ".join(value)))
 
 
 def report_repo(org, repo):
@@ -97,11 +142,16 @@ def report_repo(org, repo):
         except Forbidden:
             entry["protected_branches"][branch["name"]] = "unknown (needs admin)"
 
+    # The repository's own rulesets, in full. (Organization rulesets are
+    # listed once, at the start; the rules they contribute show up below.)
     try:
-        for r in gh("repos/{}/rulesets?includes_parents=true&per_page=100".format(full), paginate=True):
-            entry["rulesets"].append("{} ({}, {})".format(r["name"], r.get("source_type", "?"), r.get("enforcement", "?")))
-    except (NotFound, Forbidden):
+        for r in gh("repos/{}/rulesets?per_page=100".format(full), paginate=True):
+            if r.get("source_type") == "Repository":
+                entry["rulesets"].append(summarize_ruleset(
+                    gh("repos/{}/rulesets/{}".format(full, r["id"]))))
+    except (NotFound, Forbidden) as e:
         entry["rulesets"] = None
+        entry["rulesets_error"] = str(e)
     try:
         entry["rules_on_default_branch"] = sorted(summarize_rule(r) for r in gh(
             "repos/{}/rules/branches/{}".format(full, default)))
@@ -131,8 +181,10 @@ def print_entry(e):
         for key, value in p.items():
             if value not in (None, False, []):
                 print("    {}: {}".format(key, value))
-    if e["rulesets"]:
-        print("  rulesets: {}".format("; ".join(e["rulesets"])))
+    if e["rulesets"] is None:
+        print("  rulesets: unknown ({})".format(e.get("rulesets_error")))
+    for r in e["rulesets"] or []:
+        print_ruleset(r, "  ")
     if e["rules_on_default_branch"]:
         print("  ruleset rules on {}: {}".format(e["default_branch"], ", ".join(e["rules_on_default_branch"])))
     props = {k: v for k, v in e["properties"].items() if v is not None}
@@ -145,7 +197,9 @@ def signature(e):
     if "error" in e:
         return "error"
     classic = e["protected_branches"].get(e["default_branch"])
-    return json.dumps({"classic": classic, "rules": e["rules_on_default_branch"] or []}, sort_keys=True)
+    rulesets = [{k: v for k, v in r.items() if k not in ("name", "source")} for r in e["rulesets"] or []]
+    return json.dumps({"classic": classic, "rules": e["rules_on_default_branch"] or [],
+                       "rulesets": rulesets}, sort_keys=True)
 
 
 def main():
@@ -160,6 +214,14 @@ def main():
     if not args.include_archived:
         repos = [r for r in repos if not r["archived"]]
 
+    org_rulesets = []
+    try:
+        for r in gh("orgs/{}/rulesets?per_page=100".format(args.org), paginate=True):
+            org_rulesets.append(summarize_ruleset(gh("orgs/{}/rulesets/{}".format(args.org, r["id"]))))
+        org_error = None
+    except (NotFound, Forbidden) as e:
+        org_error = str(e)
+
     entries = []
     for repo in repos:
         print("Reading {}...".format(repo["name"]), file=sys.stderr)
@@ -170,10 +232,18 @@ def main():
                             "private": repo["private"], "error": str(e)})
 
     if args.json:
-        json.dump(entries, sys.stdout, indent=2)
+        json.dump({"organization_rulesets": org_rulesets, "repositories": entries}, sys.stdout, indent=2)
         print()
         return
 
+    print("Organization rulesets:")
+    if org_error:
+        print("  unknown ({})".format(org_error))
+    elif not org_rulesets:
+        print("  none")
+    for r in org_rulesets:
+        print_ruleset(r, "  ")
+    print()
     for e in entries:
         print_entry(e)
     print()
@@ -195,7 +265,10 @@ def main():
                 desc = "classic: " + ", ".join("{}={}".format(k, v) for k, v in classic.items()
                                                if v not in (None, False, []))
             if s["rules"]:
-                desc += "; rules: " + ", ".join(s["rules"])
+                desc += "; rules in effect: " + ", ".join(s["rules"])
+            for r in s["rulesets"]:
+                desc += "; ruleset ({}, target {}): {}".format(
+                    r["enforcement"], r["target"], ", ".join(r["rules"]) or "no rules")
         print()
         print("{} {}: {}".format(len(names), "repository" if len(names) == 1 else "repositories", desc))
         print("  " + " ".join(names))
