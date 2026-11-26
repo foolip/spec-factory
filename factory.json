@@ -1,7 +1,6 @@
 {
   "compat": {
-    "extra_files": "*.png",
-    "settings": {"push_users": ["miketaylr"]}
+    "extra_files": "*.png"
   },
   "console": {
     "extra_files": "images/*.*",
@@ -25,8 +24,7 @@
   },
   "fetch": {
     "extra_implementers": ["Deno (not for CORS changes)"],
-    "readme": "README.md.anne.template-part",
-    "settings": {"push_teams": ["editors-all-specs"]}
+    "readme": "README.md.anne.template-part"
   },
   "hid": {
     "extra_files": "blocklist.txt",
@@ -43,9 +41,6 @@
   "infra": {
     "not_these_templates": [".github/pull_request_template.md"],
     "readme": "README.md.anne.template-part"
-  },
-  "mimesniff": {
-    "settings": {"push_users": ["GPHemsley"]}
   },
   "notifications": {
     "readme": "README.md.anne.template-part"

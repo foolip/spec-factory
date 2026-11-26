@@ -164,22 +164,17 @@ REQUIRED_CHECKS = ["Build", "Participation"]
 #   "default ..."           no deletion, no force pushes, linear history, pull
 #                           requests, required checks; no bypass
 #   "approval ..."          1 approving review, which the standard's editors
-#                           and authors (per whatwg/sg's db.json) can bypass on
-#                           pull requests: they can merge their own pull
-#                           requests, but still not push directly or skip the
-#                           checks
-#   "push restriction ..."  only some teams or people can push or merge
+#                           (per whatwg/sg's db.json) can bypass on pull
+#                           requests: they can merge their own pull requests,
+#                           but still not push directly or skip the checks
 #
 # "settings" in factory.json adjusts these per standard:
 #   "extra_required_checks": ["Test"]   checks required besides REQUIRED_CHECKS
 #   "require_up_to_date": true          branches must be up to date to merge
-#   "push_teams": ["editors-all-specs"] only these teams and push_users can
-#   "push_users": ["miketaylr"]         push or merge to the default branch
 MANAGED = " (via spec-factory, do not edit)"
 DEFAULT_RULESET = "default" + MANAGED
 APPROVAL_RULESET = "approval" + MANAGED
-PUSH_RESTRICTION_RULESET = "push restriction" + MANAGED
-SETTINGS = {"extra_required_checks", "require_up_to_date", "push_teams", "push_users"}
+SETTINGS = {"extra_required_checks", "require_up_to_date"}
 BRANCH = {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}}
 
 
@@ -223,30 +218,23 @@ def pull_request_rule(approvals):
     }}
 
 
-def editors_and_authors(shortname):
-    """The workstream editors and the authors of a standard, per db.json, as
-    (name, GitHub login or None) pairs."""
+def editors(shortname):
+    """The editors of a standard's workstream, per db.json, as (name, GitHub
+    login or None) pairs."""
     for workstream in DB["workstreams"]:
         for standard in workstream["standards"]:
             if href_to_shortname(standard["href"]) == shortname:
-                people = workstream["editors"] + standard.get("authors", [])
-                return sorted({(p["name"], p.get("github")) for p in people}, key=lambda p: p[0])
+                return [(p["name"], p.get("github")) for p in workstream["editors"]]
     raise RuntimeError("{} isn't in db.json".format(shortname))
 
 
-IDS = {}
+USER_IDS = {}
 
 
 def user_id(login):
-    if ("user", login) not in IDS:
-        IDS[("user", login)] = gh_json("users/{}".format(login))["id"]
-    return IDS[("user", login)]
-
-
-def team_id(slug):
-    if ("team", slug) not in IDS:
-        IDS[("team", slug)] = gh_json("orgs/{}/teams/{}".format(ORG, slug))["id"]
-    return IDS[("team", slug)]
+    if login not in USER_IDS:
+        USER_IDS[login] = gh_json("users/{}".format(login))["id"]
+    return USER_IDS[login]
 
 
 def ruleset(name, rules, bypass_actors=()):
@@ -262,7 +250,7 @@ def desired_rulesets(repo):
     unknown = set(settings) - SETTINGS
     if unknown:
         raise RuntimeError("unknown settings in factory.json: {}".format(", ".join(sorted(unknown))))
-    people = editors_and_authors(shortname)
+    people = editors(shortname)
     unmapped = [name for name, login in people if not login]
     if unmapped:
         raise RuntimeError("no \"github\" in whatwg/sg's db.json for: {}".format(", ".join(unmapped)))
@@ -282,14 +270,6 @@ def desired_rulesets(repo):
     rulesets[APPROVAL_RULESET] = ruleset(APPROVAL_RULESET, [pull_request_rule(1)], [
         {"actor_type": "User", "actor_id": user_id(login), "bypass_mode": "pull_request"}
         for login in sorted({login for _, login in people})])
-    if settings.get("push_teams") or settings.get("push_users"):
-        # Only the bypass actors may update the branch, which includes merging
-        # pull requests.
-        rulesets[PUSH_RESTRICTION_RULESET] = ruleset(PUSH_RESTRICTION_RULESET, [{"type": "update"}], [
-            {"actor_type": "Team", "actor_id": team_id(t), "bypass_mode": "always"}
-            for t in settings.get("push_teams", [])] + [
-            {"actor_type": "User", "actor_id": user_id(u), "bypass_mode": "always"}
-            for u in settings.get("push_users", [])])
     return rulesets
 
 
