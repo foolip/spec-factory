@@ -13,7 +13,7 @@ This repository enables repositories of WHATWG standards to be organized central
   - `whatbot` has write access, which it needs to report the Participation check.
   - Its `standard` property is true, so that the ruleset applies. This is only set once the default branch reports both required checks, as otherwise no pull request could be merged.
   - The ruleset's rules are in effect on the default branch (anyone with read access can check this).
-  - A repository ruleset `standard: approval` requires 1 approving review, which the standard's workstream editors and authors (per whatwg/sg's `db.json`) can bypass on pull requests: they can merge their own pull requests, but not push directly. `db.json` only has names and emails, so `github-users.json` maps each email to a GitHub account; anyone missing from it is reported, and the repository is left unchanged.
+  - A repository ruleset `standard: approval` requires 1 approving review, which the standard's workstream editors and authors (per whatwg/sg's `db.json`) can bypass on pull requests: they can merge their own pull requests, but not push directly. Their GitHub accounts come from the `github` field in `db.json`; anyone without one is reported, and the repository is left unchanged.
   - Per-repository additions from `"settings"` in `factory.json` exist as repository rulesets named `standard: …`, and no other `standard: …` rulesets exist. Rulesets combine, so these can only add restrictions:
     - `"extra_required_checks": ["Test"]`: checks required in addition to `Build` and `Participation`.
     - `"require_up_to_date": true`: branches must be up to date with the default branch before merging.

@@ -311,23 +311,14 @@ def reported_checks(repo, ref):
 # Every standard also gets "standard: approval" (see above).
 EXTRA_RULESET_PREFIX = "standard: "
 
-# GitHub accounts of the people in whatwg/sg's db.json, which only has their
-# names and emails: {"email": "login"}.
-GITHUB_USERS_FILE = "github-users.json"
-
-
-def github_users():
-    return json.loads(read_file(GITHUB_USERS_FILE))
-
-
 def editors_and_authors(shortname):
-    """The workstream editors and the authors of a standard, per db.json, as
-    (name, email) pairs."""
+    """The workstream editors and the authors of a standard, per whatwg/sg's
+    db.json, as (name, GitHub login or None) pairs."""
     for workstream in DB["workstreams"]:
         for standard in workstream["standards"]:
             if href_to_shortname(standard["href"]) == shortname:
                 people = workstream["editors"] + standard.get("authors", [])
-                return sorted({(p["name"], p["email"]) for p in people})
+                return sorted({(p["name"], p.get("github")) for p in people}, key=lambda p: p[0])
     raise RuntimeError("{} isn't in db.json".format(shortname))
 
 
@@ -360,16 +351,15 @@ def desired_repo_rulesets(repo):
     # 1 approval, except for the editors and authors, who may merge their own
     # pull requests ("pull_request" bypass mode: they still can't push
     # directly, and the organization ruleset still applies to them).
-    logins = github_users()
     people = editors_and_authors(repo.split("/")[1])
-    unmapped = ["{} <{}>".format(name, email) for name, email in people if email not in logins]
+    unmapped = [name for name, login in people if not login]
     if unmapped:
-        raise RuntimeError("no GitHub account in {} for: {}".format(GITHUB_USERS_FILE, ", ".join(unmapped)))
+        raise RuntimeError("no \"github\" in whatwg/sg's db.json for: {}".format(", ".join(unmapped)))
     name = EXTRA_RULESET_PREFIX + "approval"
     rulesets[name] = {
         "name": name, "target": "branch", "enforcement": "active",
         "bypass_actors": [{"actor_type": "User", "actor_id": user_id(login), "bypass_mode": "pull_request"}
-                          for login in sorted({logins[email] for _, email in people})],
+                          for login in sorted({login for _, login in people})],
         "conditions": branch,
         "rules": [pull_request_rule(1)],
     }
@@ -439,8 +429,8 @@ def check_branch_protection(update, repo):
     the custom property), and no longer by classic branch protection."""
     problems = []
     branch = gh_api("repos/{}".format(repo), "--jq", ".default_branch").strip()
-    # Fails (e.g. an editor without a GitHub account in github-users.json)
-    # before anything is changed.
+    # Fails (e.g. an editor without a GitHub account in db.json) before
+    # anything is changed.
     repo_rulesets = desired_repo_rulesets(repo)
 
     values = gh_json("repos/{}/properties/values".format(repo))
