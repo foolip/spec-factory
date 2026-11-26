@@ -304,6 +304,12 @@ def reported_checks(repo, ref):
     return set(runs.split("\n") + statuses.split("\n")) - {""}
 
 
+def latest_merged_pull_request(repo, branch):
+    pulls = gh_json("repos/{}/pulls?state=closed&base={}&sort=updated&direction=desc&per_page=30".format(repo, branch))
+    merged = [p for p in pulls if p.get("merged_at")]
+    return max(merged, key=lambda p: p["merged_at"]) if merged else None
+
+
 def check_bot_access(update, repo):
     """whatbot reports the Participation check (a commit status), which needs
     write access."""
@@ -327,12 +333,18 @@ def check_branch_protection(update, repo):
                 if r.get("source_type") == "Repository"
                 and (r["name"] == RULESET_NAME or r["name"].startswith(RULESET_PREFIX))}
 
-    # Requiring checks that the branch doesn't report would block every pull
-    # request, so don't start protecting the branch until it reports them.
+    # Requiring checks that pull requests don't report would block them all,
+    # so don't start protecting the branch until they do. (Not the branch
+    # itself: Participation is only reported on pull requests, and squashing
+    # or rebasing makes new commits.)
     if RULESET_NAME not in existing:
-        missing = [c for c in required_checks(desired) if c not in reported_checks(repo, branch)]
+        pull = latest_merged_pull_request(repo, branch)
+        if pull is None:
+            return ["no merged pull requests to {} to see which checks they report, so not adding rulesets".format(branch)]
+        missing = [c for c in required_checks(desired) if c not in reported_checks(repo, pull["head"]["sha"])]
         if missing:
-            return ["{} doesn't report {}, so not adding rulesets".format(branch, ", ".join(missing))]
+            return ["the latest merged pull request (#{}) doesn't report {}, so not adding rulesets".format(
+                pull["number"], ", ".join(missing))]
 
     problems = []
     for name, wanted in desired.items():
