@@ -1,6 +1,7 @@
 {
   "compat": {
-    "extra_files": "*.png"
+    "extra_files": "*.png",
+    "settings": {"push_users": ["miketaylr"]}
   },
   "console": {
     "extra_files": "images/*.*",
@@ -42,6 +43,9 @@
   "infra": {
     "not_these_templates": [".github/pull_request_template.md"],
     "readme": "README.md.anne.template-part"
+  },
+  "mimesniff": {
+    "settings": {"push_users": ["GPHemsley"]}
   },
   "notifications": {
     "readme": "README.md.anne.template-part"

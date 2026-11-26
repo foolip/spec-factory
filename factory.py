@@ -161,17 +161,27 @@ BOT = "whatbot"
 # branch of every repository whose custom property "standard" is true.
 PROPERTY = "standard"
 REQUIRED_CHECKS = ["Build", "Participation"]
-RULES = [
-    {"type": "deletion"},
-    {"type": "non_fast_forward"},
-    {"type": "required_linear_history"},
-    {"type": "pull_request", "parameters": {
-        "required_approving_review_count": 1,
+
+
+def pull_request_rule(approvals):
+    return {"type": "pull_request", "parameters": {
+        "required_approving_review_count": approvals,
         "dismiss_stale_reviews_on_push": False,
         "require_code_owner_review": False,
         "require_last_push_approval": False,
         "required_review_thread_resolution": False,
-    }},
+    }}
+
+
+# The organization ruleset requires pull requests but no approval; nobody can
+# bypass it. Each standard's "standard: approval" repository ruleset then
+# requires 1 approval, which the standard's editors and authors may bypass on
+# pull requests (see desired_repo_rulesets).
+RULES = [
+    {"type": "deletion"},
+    {"type": "non_fast_forward"},
+    {"type": "required_linear_history"},
+    pull_request_rule(0),
     {"type": "required_status_checks", "parameters": {
         "strict_required_status_checks_policy": False,
         "required_status_checks": [{"context": check} for check in REQUIRED_CHECKS],
@@ -296,10 +306,38 @@ def reported_checks(repo, ref):
 # these can only add restrictions):
 #   "extra_required_checks": ["Test"]   checks required on top of REQUIRED_CHECKS
 #   "require_up_to_date": true          branches must be up to date before merging
-#   "push_teams": ["editors-all-specs"] only these teams can push or merge to
-#                                       the default branch (rulesets can't
-#                                       exempt individual users)
+#   "push_teams": ["editors-all-specs"] only these teams (and push_users) can
+#   "push_users": ["miketaylr"]         push or merge to the default branch
+# Every standard also gets "standard: approval" (see above).
 EXTRA_RULESET_PREFIX = "standard: "
+
+# GitHub accounts of the people in whatwg/sg's db.json, which only has their
+# names and emails: {"email": "login"}.
+GITHUB_USERS_FILE = "github-users.json"
+
+
+def github_users():
+    return json.loads(read_file(GITHUB_USERS_FILE))
+
+
+def editors_and_authors(shortname):
+    """The workstream editors and the authors of a standard, per db.json, as
+    (name, email) pairs."""
+    for workstream in DB["workstreams"]:
+        for standard in workstream["standards"]:
+            if href_to_shortname(standard["href"]) == shortname:
+                people = workstream["editors"] + standard.get("authors", [])
+                return sorted({(p["name"], p["email"]) for p in people})
+    raise RuntimeError("{} isn't in db.json".format(shortname))
+
+
+USER_IDS = {}
+
+
+def user_id(login):
+    if login not in USER_IDS:
+        USER_IDS[login] = gh_json("users/{}".format(login))["id"]
+    return USER_IDS[login]
 
 
 def repo_settings(repo):
@@ -313,11 +351,28 @@ def team_id(slug):
 def desired_repo_rulesets(repo):
     """The repository rulesets that factory.json asks for, by name."""
     settings = repo_settings(repo)
-    unknown = set(settings) - {"extra_required_checks", "require_up_to_date", "push_teams"}
+    unknown = set(settings) - {"extra_required_checks", "require_up_to_date", "push_teams", "push_users"}
     if unknown:
         raise RuntimeError("unknown settings in factory.json: {}".format(", ".join(sorted(unknown))))
     branch = {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}}
     rulesets = {}
+
+    # 1 approval, except for the editors and authors, who may merge their own
+    # pull requests ("pull_request" bypass mode: they still can't push
+    # directly, and the organization ruleset still applies to them).
+    logins = github_users()
+    people = editors_and_authors(repo.split("/")[1])
+    unmapped = ["{} <{}>".format(name, email) for name, email in people if email not in logins]
+    if unmapped:
+        raise RuntimeError("no GitHub account in {} for: {}".format(GITHUB_USERS_FILE, ", ".join(unmapped)))
+    name = EXTRA_RULESET_PREFIX + "approval"
+    rulesets[name] = {
+        "name": name, "target": "branch", "enforcement": "active",
+        "bypass_actors": [{"actor_type": "User", "actor_id": user_id(login), "bypass_mode": "pull_request"}
+                          for login in sorted({logins[email] for _, email in people})],
+        "conditions": branch,
+        "rules": [pull_request_rule(1)],
+    }
     up_to_date = settings.get("require_up_to_date", False)
     checks = list(settings.get("extra_required_checks", []))
     if up_to_date:
@@ -334,14 +389,16 @@ def desired_repo_rulesets(repo):
                 "required_status_checks": [{"context": c} for c in checks],
             }}],
         }
-    if settings.get("push_teams"):
+    if settings.get("push_teams") or settings.get("push_users"):
         name = EXTRA_RULESET_PREFIX + "push restriction"
         rulesets[name] = {
             "name": name, "target": "branch", "enforcement": "active",
             # Only the bypass actors may update the branch, which includes
             # merging pull requests.
             "bypass_actors": [{"actor_type": "Team", "actor_id": team_id(t), "bypass_mode": "always"}
-                              for t in settings["push_teams"]],
+                              for t in settings.get("push_teams", [])] +
+                             [{"actor_type": "User", "actor_id": user_id(u), "bypass_mode": "always"}
+                              for u in settings.get("push_users", [])],
             "conditions": branch,
             "rules": [{"type": "update"}],
         }
@@ -382,6 +439,9 @@ def check_branch_protection(update, repo):
     the custom property), and no longer by classic branch protection."""
     problems = []
     branch = gh_api("repos/{}".format(repo), "--jq", ".default_branch").strip()
+    # Fails (e.g. an editor without a GitHub account in github-users.json)
+    # before anything is changed.
+    repo_rulesets = desired_repo_rulesets(repo)
 
     values = gh_json("repos/{}/properties/values".format(repo))
     if not any(v["property_name"] == PROPERTY and v["value"] == "true" for v in values):
@@ -401,7 +461,7 @@ def check_branch_protection(update, repo):
     # The rules in effect on the branch, from any ruleset. Anyone with read
     # access can see these.
     effective = gh_json("repos/{}/rules/branches/{}".format(repo, branch))
-    expected = RULES + [rule for r in desired_repo_rulesets(repo).values() for rule in r["rules"]]
+    expected = RULES + [rule for r in repo_rulesets.values() for rule in r["rules"]]
     for rule in expected:
         if not any(contains(rule, r) for r in effective):
             problems.append("rule {} isn't in effect on {}".format(rule["type"], branch))
