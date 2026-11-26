@@ -150,62 +150,35 @@ def create_pr(shortname):
 
 
 # Repository settings on GitHub, checked by --check-settings and fixed by
-# --update-settings. Organization-level settings are checked once, then each
-# repository's. Each check takes whether to fix it (and the repository) and
-# returns a list of problems that remain.
+# --update-settings. Each check takes whether to fix it and the repository
+# ("whatwg/<shortname>"), and returns a list of problems that remain.
 
 ORG = "whatwg"
 BOT = "whatbot"
-
-# Branch protection is an organization ruleset that applies to the default
-# branch of every repository whose custom property "standard" is true.
-PROPERTY = "standard"
 REQUIRED_CHECKS = ["Build", "Participation"]
 
-
-def pull_request_rule(approvals):
-    return {"type": "pull_request", "parameters": {
-        "required_approving_review_count": approvals,
-        "dismiss_stale_reviews_on_push": False,
-        "require_code_owner_review": False,
-        "require_last_push_approval": False,
-        "required_review_thread_resolution": False,
-    }}
-
-
-# The organization ruleset requires pull requests but no approval; nobody can
-# bypass it. Each standard's "standard: approval" repository ruleset then
-# requires 1 approval, which the standard's editors and authors may bypass on
-# pull requests (see desired_repo_rulesets).
-RULES = [
-    {"type": "deletion"},
-    {"type": "non_fast_forward"},
-    {"type": "required_linear_history"},
-    pull_request_rule(0),
-    {"type": "required_status_checks", "parameters": {
-        "strict_required_status_checks_policy": False,
-        "required_status_checks": [{"context": check} for check in REQUIRED_CHECKS],
-    }},
-]
-RULESET = {
-    "name": "standards",
-    "target": "branch",
-    "enforcement": "active",
-    "bypass_actors": [],
-    "conditions": {
-        "ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []},
-        "repository_property": {
-            "include": [{"name": PROPERTY, "property_values": ["true"], "source": "custom"}],
-            "exclude": [],
-        },
-    },
-    "rules": RULES,
-}
-PROPERTY_SCHEMA = {
-    "value_type": "true_false",
-    "required": False,
-    "description": "A WHATWG standard: its default branch is protected by the standards ruleset (see whatwg/spec-factory)",
-}
+# The default branch of each standard is protected by repository rulesets
+# named "standard" and "standard: ...". A ruleset's bypass list applies to all
+# its rules, so they're split up:
+#
+#   "standard"                    no deletion, no force pushes, linear history,
+#                                 pull requests, required checks; no bypass
+#   "standard: approval"          1 approving review, which the standard's
+#                                 editors and authors (per whatwg/sg's db.json)
+#                                 can bypass on pull requests: they can merge
+#                                 their own pull requests, but still not push
+#                                 directly or skip the checks
+#   "standard: push restriction"  only some teams or people can push or merge
+#
+# "settings" in factory.json adjusts these per standard:
+#   "extra_required_checks": ["Test"]   checks required besides REQUIRED_CHECKS
+#   "require_up_to_date": true          branches must be up to date to merge
+#   "push_teams": ["editors-all-specs"] only these teams and push_users can
+#   "push_users": ["miketaylr"]         push or merge to the default branch
+RULESET_NAME = "standard"
+RULESET_PREFIX = "standard: "
+SETTINGS = {"extra_required_checks", "require_up_to_date", "push_teams", "push_users"}
+BRANCH = {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}}
 
 
 def gh_api(*args, input=None, allow_404=False):
@@ -216,10 +189,6 @@ def gh_api(*args, input=None, allow_404=False):
         input = json.dumps(input)
     result = subprocess.run(command, input=input, capture_output=True, text=True)
     if result.returncode != 0:
-        # GitHub answers 404 when the token lacks a scope, so that isn't
-        # "doesn't exist".
-        if "admin:org" in result.stderr:
-            raise RuntimeError("gh needs the admin:org scope: gh auth refresh -h github.com -s admin:org")
         if allow_404 and "HTTP 404" in result.stderr:
             return None
         raise RuntimeError("gh api {}: {}".format(" ".join(args), result.stderr.strip()))
@@ -242,44 +211,97 @@ def contains(expected, actual):
     return expected == actual
 
 
-def check_property_schema(update):
-    if gh_json("orgs/{}/properties/schema/{}".format(ORG, PROPERTY), allow_404=True) is not None:
-        return []
-    if not update:
-        return ["no custom property {!r}".format(PROPERTY)]
-    gh_api("-X", "PUT", "orgs/{}/properties/schema/{}".format(ORG, PROPERTY), input=PROPERTY_SCHEMA)
-    print("  fixed: created the custom property {!r}".format(PROPERTY))
-    return []
+def pull_request_rule(approvals):
+    return {"type": "pull_request", "parameters": {
+        "required_approving_review_count": approvals,
+        "dismiss_stale_reviews_on_push": False,
+        "require_code_owner_review": False,
+        "require_last_push_approval": False,
+        "required_review_thread_resolution": False,
+    }}
 
 
-def check_org_ruleset(update):
-    try:
-        rulesets = gh_json("orgs/{}/rulesets".format(ORG))
-    except RuntimeError as e:
-        # Reading organization rulesets needs an organization owner. Without
-        # that, the per-repository check of the rules in effect still runs.
-        if update or not any(x in str(e) for x in ("HTTP 403", "HTTP 404", "admin:org")):
-            raise
-        print("  not checked: organization ruleset (needs an organization owner, and gh with the admin:org scope)")
-        return []
-    ids = [r["id"] for r in rulesets if r["name"] == RULESET["name"]]
-    if not ids:
-        if not update:
-            return ["no organization ruleset {!r}".format(RULESET["name"])]
-        gh_api("-X", "POST", "orgs/{}/rulesets".format(ORG), input=RULESET)
-        print("  fixed: created the organization ruleset {!r}".format(RULESET["name"]))
-        return []
-    current = gh_json("orgs/{}/rulesets/{}".format(ORG, ids[0]))
-    if contains(RULESET, current):
-        return []
-    if not update:
-        return ["organization ruleset {!r} differs from factory.py".format(RULESET["name"])]
-    gh_api("-X", "PUT", "orgs/{}/rulesets/{}".format(ORG, ids[0]), input=RULESET)
-    print("  fixed: updated the organization ruleset {!r}".format(RULESET["name"]))
-    return []
+def editors_and_authors(shortname):
+    """The workstream editors and the authors of a standard, per db.json, as
+    (name, GitHub login or None) pairs."""
+    for workstream in DB["workstreams"]:
+        for standard in workstream["standards"]:
+            if href_to_shortname(standard["href"]) == shortname:
+                people = workstream["editors"] + standard.get("authors", [])
+                return sorted({(p["name"], p.get("github")) for p in people}, key=lambda p: p[0])
+    raise RuntimeError("{} isn't in db.json".format(shortname))
 
 
-ORG_CHECKS = [check_property_schema, check_org_ruleset]
+IDS = {}
+
+
+def user_id(login):
+    if ("user", login) not in IDS:
+        IDS[("user", login)] = gh_json("users/{}".format(login))["id"]
+    return IDS[("user", login)]
+
+
+def team_id(slug):
+    if ("team", slug) not in IDS:
+        IDS[("team", slug)] = gh_json("orgs/{}/teams/{}".format(ORG, slug))["id"]
+    return IDS[("team", slug)]
+
+
+def ruleset(name, rules, bypass_actors=()):
+    return {"name": name, "target": "branch", "enforcement": "active",
+            "bypass_actors": list(bypass_actors), "conditions": BRANCH, "rules": rules}
+
+
+def desired_rulesets(repo):
+    """The rulesets a standard's repository should have, by name. Raises if
+    factory.json or db.json is missing something."""
+    shortname = repo.split("/")[1]
+    settings = FACTORY_DB.get(shortname, {}).get("settings", {})
+    unknown = set(settings) - SETTINGS
+    if unknown:
+        raise RuntimeError("unknown settings in factory.json: {}".format(", ".join(sorted(unknown))))
+    people = editors_and_authors(shortname)
+    unmapped = [name for name, login in people if not login]
+    if unmapped:
+        raise RuntimeError("no \"github\" in whatwg/sg's db.json for: {}".format(", ".join(unmapped)))
+
+    checks = REQUIRED_CHECKS + [c for c in settings.get("extra_required_checks", []) if c not in REQUIRED_CHECKS]
+    rulesets = {}
+    rulesets[RULESET_NAME] = ruleset(RULESET_NAME, [
+        {"type": "deletion"},
+        {"type": "non_fast_forward"},
+        {"type": "required_linear_history"},
+        pull_request_rule(0),
+        {"type": "required_status_checks", "parameters": {
+            "strict_required_status_checks_policy": settings.get("require_up_to_date", False),
+            "required_status_checks": [{"context": c} for c in checks],
+        }},
+    ])
+    name = RULESET_PREFIX + "approval"
+    rulesets[name] = ruleset(name, [pull_request_rule(1)], [
+        {"actor_type": "User", "actor_id": user_id(login), "bypass_mode": "pull_request"}
+        for login in sorted({login for _, login in people})])
+    if settings.get("push_teams") or settings.get("push_users"):
+        name = RULESET_PREFIX + "push restriction"
+        # Only the bypass actors may update the branch, which includes merging
+        # pull requests.
+        rulesets[name] = ruleset(name, [{"type": "update"}], [
+            {"actor_type": "Team", "actor_id": team_id(t), "bypass_mode": "always"}
+            for t in settings.get("push_teams", [])] + [
+            {"actor_type": "User", "actor_id": user_id(u), "bypass_mode": "always"}
+            for u in settings.get("push_users", [])])
+    return rulesets
+
+
+def required_checks(rulesets):
+    return [c["context"] for rule in rulesets[RULESET_NAME]["rules"] if rule["type"] == "required_status_checks"
+            for c in rule["parameters"]["required_status_checks"]]
+
+
+def reported_checks(repo, ref):
+    runs = gh_api("repos/{}/commits/{}/check-runs".format(repo, ref), "--paginate", "--jq", ".check_runs[].name")
+    statuses = gh_api("repos/{}/commits/{}/status".format(repo, ref), "--jq", ".statuses[].context")
+    return set(runs.split("\n") + statuses.split("\n")) - {""}
 
 
 def check_bot_access(update, repo):
@@ -295,171 +317,58 @@ def check_bot_access(update, repo):
     return ["{} has {} access, needs write".format(BOT, permission)]
 
 
-def reported_checks(repo, ref):
-    runs = gh_api("repos/{}/commits/{}/check-runs".format(repo, ref), "--paginate", "--jq", ".check_runs[].name")
-    statuses = gh_api("repos/{}/commits/{}/status".format(repo, ref), "--jq", ".statuses[].context")
-    return set(runs.split("\n") + statuses.split("\n")) - {""}
-
-
-# Per-repository additions to the organization ruleset, from "settings" in
-# factory.json, each applied as a repository ruleset (rulesets combine, so
-# these can only add restrictions):
-#   "extra_required_checks": ["Test"]   checks required on top of REQUIRED_CHECKS
-#   "require_up_to_date": true          branches must be up to date before merging
-#   "push_teams": ["editors-all-specs"] only these teams (and push_users) can
-#   "push_users": ["miketaylr"]         push or merge to the default branch
-# Every standard also gets "standard: approval" (see above).
-EXTRA_RULESET_PREFIX = "standard: "
-
-def editors_and_authors(shortname):
-    """The workstream editors and the authors of a standard, per whatwg/sg's
-    db.json, as (name, GitHub login or None) pairs."""
-    for workstream in DB["workstreams"]:
-        for standard in workstream["standards"]:
-            if href_to_shortname(standard["href"]) == shortname:
-                people = workstream["editors"] + standard.get("authors", [])
-                return sorted({(p["name"], p.get("github")) for p in people}, key=lambda p: p[0])
-    raise RuntimeError("{} isn't in db.json".format(shortname))
-
-
-USER_IDS = {}
-
-
-def user_id(login):
-    if login not in USER_IDS:
-        USER_IDS[login] = gh_json("users/{}".format(login))["id"]
-    return USER_IDS[login]
-
-
-def repo_settings(repo):
-    return FACTORY_DB.get(repo.split("/")[1], {}).get("settings", {})
-
-
-def team_id(slug):
-    return gh_json("orgs/{}/teams/{}".format(ORG, slug))["id"]
-
-
-def desired_repo_rulesets(repo):
-    """The repository rulesets that factory.json asks for, by name."""
-    settings = repo_settings(repo)
-    unknown = set(settings) - {"extra_required_checks", "require_up_to_date", "push_teams", "push_users"}
-    if unknown:
-        raise RuntimeError("unknown settings in factory.json: {}".format(", ".join(sorted(unknown))))
-    branch = {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}}
-    rulesets = {}
-
-    # 1 approval, except for the editors and authors, who may merge their own
-    # pull requests ("pull_request" bypass mode: they still can't push
-    # directly, and the organization ruleset still applies to them).
-    people = editors_and_authors(repo.split("/")[1])
-    unmapped = [name for name, login in people if not login]
-    if unmapped:
-        raise RuntimeError("no \"github\" in whatwg/sg's db.json for: {}".format(", ".join(unmapped)))
-    name = EXTRA_RULESET_PREFIX + "approval"
-    rulesets[name] = {
-        "name": name, "target": "branch", "enforcement": "active",
-        "bypass_actors": [{"actor_type": "User", "actor_id": user_id(login), "bypass_mode": "pull_request"}
-                          for login in sorted({login for _, login in people})],
-        "conditions": branch,
-        "rules": [pull_request_rule(1)],
-    }
-    up_to_date = settings.get("require_up_to_date", False)
-    checks = list(settings.get("extra_required_checks", []))
-    if up_to_date:
-        # "Up to date" is a property of a set of required checks, so this
-        # ruleset requires all of them, strictly.
-        checks = REQUIRED_CHECKS + [c for c in checks if c not in REQUIRED_CHECKS]
-    if checks:
-        name = EXTRA_RULESET_PREFIX + "required checks"
-        rulesets[name] = {
-            "name": name, "target": "branch", "enforcement": "active", "bypass_actors": [],
-            "conditions": branch,
-            "rules": [{"type": "required_status_checks", "parameters": {
-                "strict_required_status_checks_policy": up_to_date,
-                "required_status_checks": [{"context": c} for c in checks],
-            }}],
-        }
-    if settings.get("push_teams") or settings.get("push_users"):
-        name = EXTRA_RULESET_PREFIX + "push restriction"
-        rulesets[name] = {
-            "name": name, "target": "branch", "enforcement": "active",
-            # Only the bypass actors may update the branch, which includes
-            # merging pull requests.
-            "bypass_actors": [{"actor_type": "Team", "actor_id": team_id(t), "bypass_mode": "always"}
-                              for t in settings.get("push_teams", [])] +
-                             [{"actor_type": "User", "actor_id": user_id(u), "bypass_mode": "always"}
-                              for u in settings.get("push_users", [])],
-            "conditions": branch,
-            "rules": [{"type": "update"}],
-        }
-    return rulesets
-
-
-def check_repo_rulesets(update, repo):
-    """The repository rulesets from factory.json exist and match; other
-    rulesets that factory.py manages (by name) are removed."""
-    problems = []
-    desired = desired_repo_rulesets(repo)
+def check_branch_protection(update, repo):
+    """The default branch is protected by the rulesets from desired_rulesets
+    (and no others named "standard..."), and no longer by classic branch
+    protection."""
+    desired = desired_rulesets(repo)
+    branch = gh_api("repos/{}".format(repo), "--jq", ".default_branch").strip()
     existing = {r["name"]: r["id"] for r in gh_json("repos/{}/rulesets".format(repo))
-                if r.get("source_type") == "Repository" and r["name"].startswith(EXTRA_RULESET_PREFIX)}
-    for name, ruleset in desired.items():
+                if r.get("source_type") == "Repository"
+                and (r["name"] == RULESET_NAME or r["name"].startswith(RULESET_PREFIX))}
+
+    # Requiring checks that the branch doesn't report would block every pull
+    # request, so don't start protecting the branch until it reports them.
+    if RULESET_NAME not in existing:
+        missing = [c for c in required_checks(desired) if c not in reported_checks(repo, branch)]
+        if missing:
+            return ["{} doesn't report {}, so not adding rulesets".format(branch, ", ".join(missing))]
+
+    problems = []
+    for name, wanted in desired.items():
         if name not in existing:
             if not update:
-                problems.append("no repository ruleset {!r}".format(name))
+                problems.append("no ruleset {!r}".format(name))
                 continue
-            gh_api("-X", "POST", "repos/{}/rulesets".format(repo), input=ruleset)
-            print("  fixed: created the repository ruleset {!r}".format(name))
-        elif not contains(ruleset, gh_json("repos/{}/rulesets/{}".format(repo, existing[name]))):
+            gh_api("-X", "POST", "repos/{}/rulesets".format(repo), input=wanted)
+            print("  fixed: created the ruleset {!r}".format(name))
+        elif not contains(wanted, gh_json("repos/{}/rulesets/{}".format(repo, existing[name]))):
             if not update:
-                problems.append("repository ruleset {!r} differs from factory.json".format(name))
+                problems.append("ruleset {!r} differs from factory.py".format(name))
                 continue
-            gh_api("-X", "PUT", "repos/{}/rulesets/{}".format(repo, existing[name]), input=ruleset)
-            print("  fixed: updated the repository ruleset {!r}".format(name))
+            gh_api("-X", "PUT", "repos/{}/rulesets/{}".format(repo, existing[name]), input=wanted)
+            print("  fixed: updated the ruleset {!r}".format(name))
     for name in set(existing) - set(desired):
         if not update:
-            problems.append("repository ruleset {!r} isn't in factory.json".format(name))
+            problems.append("ruleset {!r} isn't wanted by factory.py".format(name))
             continue
         gh_api("-X", "DELETE", "repos/{}/rulesets/{}".format(repo, existing[name]))
-        print("  fixed: deleted the repository ruleset {!r}".format(name))
-    return problems
+        print("  fixed: deleted the ruleset {!r}".format(name))
+    if problems:
+        return problems
 
-
-def check_branch_protection(update, repo):
-    """The default branch is protected by the organization ruleset (through
-    the custom property), and no longer by classic branch protection."""
-    problems = []
-    branch = gh_api("repos/{}".format(repo), "--jq", ".default_branch").strip()
-    # Fails (e.g. an editor without a GitHub account in db.json) before
-    # anything is changed.
-    repo_rulesets = desired_repo_rulesets(repo)
-
-    values = gh_json("repos/{}/properties/values".format(repo))
-    if not any(v["property_name"] == PROPERTY and v["value"] == "true" for v in values):
-        # Setting the property makes the ruleset require the checks, so only
-        # do that once the branch reports them; otherwise no PR could merge.
-        missing = [c for c in REQUIRED_CHECKS if c not in reported_checks(repo, branch)]
-        if missing:
-            return ["{} doesn't report {}, so not setting {!r}".format(branch, ", ".join(missing), PROPERTY)]
-        if not update:
-            return ["custom property {!r} isn't true".format(PROPERTY)]
-        gh_api("-X", "PATCH", "orgs/{}/properties/values".format(ORG), input={
-            "repository_names": [repo.split("/")[1]],
-            "properties": [{"property_name": PROPERTY, "value": "true"}],
-        })
-        print("  fixed: set {!r} to true".format(PROPERTY))
-
-    # The rules in effect on the branch, from any ruleset. Anyone with read
-    # access can see these.
+    # The rules in effect on the branch (anyone with read access can see
+    # these) must include all of the above before classic branch protection
+    # can go.
     effective = gh_json("repos/{}/rules/branches/{}".format(repo, branch))
-    expected = RULES + [rule for r in repo_rulesets.values() for rule in r["rules"]]
-    for rule in expected:
+    for rule in (rule for r in desired.values() for rule in r["rules"]):
         if not any(contains(rule, r) for r in effective):
             problems.append("rule {} isn't in effect on {}".format(rule["type"], branch))
     if problems:
         return problems
 
-    # Classic branch protection is redundant once the ruleset is in effect.
-    # Reading it needs admin access; without it, this part isn't checked.
+    # Reading classic branch protection needs admin access; without it, this
+    # part isn't checked.
     try:
         classic = gh_json("repos/{}/branches/{}/protection".format(repo, branch), allow_404=True)
     except RuntimeError:
@@ -469,34 +378,26 @@ def check_branch_protection(update, repo):
             return ["{} still has classic branch protection (redundant)".format(branch)]
         gh_api("-X", "DELETE", "repos/{}/branches/{}/protection".format(repo, branch))
         print("  fixed: deleted classic branch protection")
-    return problems
+    return []
 
 
-# check_repo_rulesets comes before check_branch_protection, so that the
-# additions are in effect before classic branch protection is deleted.
-REPO_CHECKS = [check_bot_access, check_repo_rulesets, check_branch_protection]
-
-
-def run_checks(label, checks, update, *args):
-    print(label)
-    ok = True
-    for check in checks:
-        try:
-            problems = check(update, *args)
-        except RuntimeError as e:
-            problems = [str(e)]
-        for problem in problems:
-            print("  problem: {}".format(problem))
-        ok = ok and not problems
-    return ok
+REPO_CHECKS = [check_bot_access, check_branch_protection]
 
 
 def settings(shortnames, update):
     """Returns whether all settings are (now) correct."""
-    ok = run_checks(ORG, ORG_CHECKS, update)
+    ok = True
     for shortname in shortnames:
         repo = "{}/{}".format(ORG, shortname)
-        ok = run_checks(repo, REPO_CHECKS, update, repo) and ok
+        print(repo)
+        for check in REPO_CHECKS:
+            try:
+                problems = check(update, repo)
+            except RuntimeError as e:
+                problems = [str(e)]
+            for problem in problems:
+                print("  problem: {}".format(problem))
+            ok = ok and not problems
     return ok
 
 
