@@ -158,25 +158,27 @@ BOT = "whatbot"
 REQUIRED_CHECKS = ["Build", "Participation"]
 
 # The default branch of each standard is protected by repository rulesets
-# named "standard" and "standard: ...". A ruleset's bypass list applies to all
-# its rules, so they're split up:
+# whose names end in MANAGED (any others are left alone). A ruleset's bypass
+# list applies to all its rules, so they're split up:
 #
-#   "standard"                    no deletion, no force pushes, linear history,
-#                                 pull requests, required checks; no bypass
-#   "standard: approval"          1 approving review, which the standard's
-#                                 editors and authors (per whatwg/sg's db.json)
-#                                 can bypass on pull requests: they can merge
-#                                 their own pull requests, but still not push
-#                                 directly or skip the checks
-#   "standard: push restriction"  only some teams or people can push or merge
+#   "default ..."           no deletion, no force pushes, linear history, pull
+#                           requests, required checks; no bypass
+#   "approval ..."          1 approving review, which the standard's editors
+#                           and authors (per whatwg/sg's db.json) can bypass on
+#                           pull requests: they can merge their own pull
+#                           requests, but still not push directly or skip the
+#                           checks
+#   "push restriction ..."  only some teams or people can push or merge
 #
 # "settings" in factory.json adjusts these per standard:
 #   "extra_required_checks": ["Test"]   checks required besides REQUIRED_CHECKS
 #   "require_up_to_date": true          branches must be up to date to merge
 #   "push_teams": ["editors-all-specs"] only these teams and push_users can
 #   "push_users": ["miketaylr"]         push or merge to the default branch
-RULESET_NAME = "standard"
-RULESET_PREFIX = "standard: "
+MANAGED = " (via spec-factory, do not edit)"
+DEFAULT_RULESET = "default" + MANAGED
+APPROVAL_RULESET = "approval" + MANAGED
+PUSH_RESTRICTION_RULESET = "push restriction" + MANAGED
 SETTINGS = {"extra_required_checks", "require_up_to_date", "push_teams", "push_users"}
 BRANCH = {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}}
 
@@ -267,7 +269,7 @@ def desired_rulesets(repo):
 
     checks = REQUIRED_CHECKS + [c for c in settings.get("extra_required_checks", []) if c not in REQUIRED_CHECKS]
     rulesets = {}
-    rulesets[RULESET_NAME] = ruleset(RULESET_NAME, [
+    rulesets[DEFAULT_RULESET] = ruleset(DEFAULT_RULESET, [
         {"type": "deletion"},
         {"type": "non_fast_forward"},
         {"type": "required_linear_history"},
@@ -277,15 +279,13 @@ def desired_rulesets(repo):
             "required_status_checks": [{"context": c} for c in checks],
         }},
     ])
-    name = RULESET_PREFIX + "approval"
-    rulesets[name] = ruleset(name, [pull_request_rule(1)], [
+    rulesets[APPROVAL_RULESET] = ruleset(APPROVAL_RULESET, [pull_request_rule(1)], [
         {"actor_type": "User", "actor_id": user_id(login), "bypass_mode": "pull_request"}
         for login in sorted({login for _, login in people})])
     if settings.get("push_teams") or settings.get("push_users"):
-        name = RULESET_PREFIX + "push restriction"
         # Only the bypass actors may update the branch, which includes merging
         # pull requests.
-        rulesets[name] = ruleset(name, [{"type": "update"}], [
+        rulesets[PUSH_RESTRICTION_RULESET] = ruleset(PUSH_RESTRICTION_RULESET, [{"type": "update"}], [
             {"actor_type": "Team", "actor_id": team_id(t), "bypass_mode": "always"}
             for t in settings.get("push_teams", [])] + [
             {"actor_type": "User", "actor_id": user_id(u), "bypass_mode": "always"}
@@ -294,7 +294,7 @@ def desired_rulesets(repo):
 
 
 def required_checks(rulesets):
-    return [c["context"] for rule in rulesets[RULESET_NAME]["rules"] if rule["type"] == "required_status_checks"
+    return [c["context"] for rule in rulesets[DEFAULT_RULESET]["rules"] if rule["type"] == "required_status_checks"
             for c in rule["parameters"]["required_status_checks"]]
 
 
@@ -325,19 +325,19 @@ def check_bot_access(update, repo):
 
 def check_branch_protection(update, repo):
     """The default branch is protected by the rulesets from desired_rulesets
-    (and no others named "standard..."), and no longer by classic branch
+    (and no others whose names end in MANAGED), and no longer by classic branch
     protection."""
     desired = desired_rulesets(repo)
     branch = gh_api("repos/{}".format(repo), "--jq", ".default_branch").strip()
     existing = {r["name"]: r["id"] for r in gh_json("repos/{}/rulesets".format(repo))
                 if r.get("source_type") == "Repository"
-                and (r["name"] == RULESET_NAME or r["name"].startswith(RULESET_PREFIX))}
+                and r["name"].endswith(MANAGED)}
 
     # Requiring checks that pull requests don't report would block them all,
     # so don't start protecting the branch until they do. (Not the branch
     # itself: Participation is only reported on pull requests, and squashing
     # or rebasing makes new commits.)
-    if RULESET_NAME not in existing:
+    if DEFAULT_RULESET not in existing:
         pull = latest_merged_pull_request(repo, branch)
         if pull is None:
             return ["no merged pull requests to {} to see which checks they report, so not adding rulesets".format(branch)]

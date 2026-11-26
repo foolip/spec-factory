@@ -7,10 +7,10 @@ This repository enables repositories of WHATWG standards to be organized central
 `factory.py --check-settings --all` checks the GitHub settings of the standards' repositories, and `factory.py --update-settings --all` fixes them (both also work with `--single <shortname> <h1>` instead of `--all`). They need `gh`, logged in as someone with admin access for `--update-settings`, and exit with status 1 if a problem remains. In each standard's repository:
 
 - `whatbot` has write access, which it needs to report the Participation check.
-- The default branch is protected by these repository rulesets, as defined in `factory.py`, and no other rulesets named `standard` or `standard: …` exist:
-  - `standard`: no deletion, no force pushes, linear history, a pull request, and the `Build` and `Participation` checks passing. Nobody can bypass it. It's only created once the default branch reports the required checks, as otherwise no pull request could be merged.
-  - `standard: approval`: 1 approving review, which the standard's workstream editors and authors (per whatwg/sg's `db.json`) can bypass on pull requests: they can merge their own pull requests, but not push directly or skip the checks. (A bypass applies to every rule in its ruleset, which is why this is separate.) Their GitHub accounts come from the `github` field in `db.json`; anyone without one is reported, and the repository is left unchanged.
-  - `standard: push restriction`: only if `push_teams` or `push_users` is set, see below.
+- The default branch is protected by these repository rulesets, as defined in `factory.py`, and no other rulesets whose names end in “(via spec-factory, do not edit)” exist (other rulesets are left alone):
+  - `default (via spec-factory, do not edit)`: no deletion, no force pushes, linear history, a pull request, and the `Build` and `Participation` checks passing. Nobody can bypass it. It's only created once the default branch reports the required checks, as otherwise no pull request could be merged.
+  - `approval (via spec-factory, do not edit)`: 1 approving review, which the standard's workstream editors and authors (per whatwg/sg's `db.json`) can bypass on pull requests: they can merge their own pull requests, but not push directly or skip the checks. (A bypass applies to every rule in its ruleset, which is why this is separate.) Their GitHub accounts come from the `github` field in `db.json`; anyone without one is reported, and the repository is left unchanged.
+  - `push restriction (via spec-factory, do not edit)`: only if `push_teams` or `push_users` is set, see below.
 - `"settings"` in `factory.json` adjusts these per standard:
   - `"extra_required_checks": ["Test"]`: checks required in addition to `Build` and `Participation`.
   - `"require_up_to_date": true`: branches must be up to date with the default branch before merging.
